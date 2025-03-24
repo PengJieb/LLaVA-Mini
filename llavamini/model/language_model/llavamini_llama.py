@@ -29,6 +29,18 @@ import time
 
 class LlavaMiniConfig(LlamaConfig):
     model_type = "llava_mini_llama"
+    
+    # https://huggingface.co/tomg-group-umd/huginn-0125/blob/main/config.json
+    norm_eps = 1e-6
+    n_layers_in_recurrent_block = 4
+    embed_scale = 72.6636084983398
+    init_values_std = 0.008703882797784892
+    mean_recurrence = 32
+    mean_backprop_depth = 8
+    
+    recurrent_in_compression = False
+    recurrent_in_prefusion = False
+    recurrent_in_llm = False
 
 
 class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):

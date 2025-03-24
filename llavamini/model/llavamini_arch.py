@@ -14,6 +14,7 @@
 
 
 from abc import ABC, abstractmethod
+from typing import Optional, Union, Any, Tuple
 
 import torch
 import math
@@ -29,8 +30,13 @@ from llavamini.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_P
 
 from llavamini.mm_utils import get_anyres_image_grid_shape
 
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP
+from transformers import LlamaConfig, LlamaModel, LlamaForCausalLM
+
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+from transformers.cache_utils import Cache
+
+import os, sys
 
 def get_abs_pos(abs_pos, tgt_size):
     # abs_pos: L, C
@@ -168,11 +174,164 @@ class Resampler(nn.Module):
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
 
+
+class RMSNorm(torch.nn.Module):
+    """Saner dtype handling and slightly better for fusion"""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        with torch.autocast(enabled=False, device_type=x.device.type if x.device.type != "meta" else "cuda"):
+            return self._norm(x.float()).type_as(x) * self.weight
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.ones_(self.weight)
+
+class SandwichBlock(torch.nn.Module):
+    expanded = False
+
+    def __init__(self, config: LlamaConfig, layer_id: int) -> None:
+        super().__init__()
+        self.norm_1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_id)
+        self.norm_2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.mlp = LlamaMLP(config)
+        self.norm_3 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm_4 = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.layer_id = layer_id
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        return_attn: bool = False,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attn_out, attn_map = self.attn(self.norm_1(x), attention_mask=mask, 
+                                       past_key_value = past_key_values, 
+                                       output_attentions=return_attn,
+                                       position_ids=position_ids,
+                                       cache_position=cache_position,
+                                       position_embeddings=position_embeddings)
+        x = self.norm_2(attn_out + x)
+        x = self.norm_4(self.mlp(self.norm_3(x)) + x)
+        return x, attn_map
+
+class HuginnRecurrent(nn.Module):
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.config = config
+        self.core_block = torch.nn.ModuleList(
+            SandwichBlock(config, layer_id=i)
+            for i in range(config.n_layers_in_recurrent_block)
+        )
+        self.adapter = torch.nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.emb_scale=config.embed_scale
+        self.ln_f = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        
+    def initialize_state(self, input_embeds, deterministic: bool = False):
+        x = torch.randn_like(input_embeds)
+        std = self.config.init_values_std
+        torch.nn.init.trunc_normal_(x, mean=0.0, std=std, a=-3 * std, b=3 * std)
+        if self.emb_scale != 1:
+            x = x * self.emb_scale
+        return x if not deterministic else x.zero_()
+        
+    @torch._dynamo.disable(recursive=False)  # type: ignore
+    def randomized_iteration_sampler(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Outputs are long tensors so that they can be passed through compiled functions"""
+        t = max(self.config.mean_recurrence - self.config.mean_backprop_depth, 0)
+        s = self.config.mean_backprop_depth
+        if torch.rand((1,)).is_meta:  # annoying clause to make meta-tensor-based flop counting work
+            # these values are only the mean TFLOPs of the randomized sampler
+            # Note that this clause also breaks the contract, and returns ints in meta tensor mode
+            return t, s  # type: ignore
+        if self.training:
+            sigma = 0.5
+            mu = math.log(t + s) - (sigma**2 / 2)
+            rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma)
+            p = torch.poisson(torch.tensor([rate], dtype=torch.float)) + 1
+            n = torch.clamp(p - s, min=0)
+            k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
+        else:
+            n, k = torch.as_tensor(self.config.mean_recurrence), torch.as_tensor(0)
+
+        return n.to(dtype=torch.long), k.to(dtype=torch.long)
+        
+    def core_block_forward(self, x, hidden_states,  attn_maps: dict = {},
+                           attention_mask: Optional[torch.Tensor] = None,
+                            position_ids: Optional[torch.LongTensor] = None,
+                            past_key_value: Optional[Cache] = None,
+                            output_attentions: bool = False,
+                            use_cache: bool = False,
+                            cache_position: Optional[torch.LongTensor] = None,
+                            position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45)
+    ):
+        x = self.adapter(torch.cat([x, hidden_states.to(x.device)], dim=-1))
+        for idx, block in enumerate(self.core_block, start=1):
+            x, attn_map = block(x, attention_mask=attention_mask, past_key_value=past_key_value,
+                                return_attn=output_attentions, position_ids=position_ids,
+                                cache_position=cache_position, position_embeddings=position_embeddings)
+            attn_maps[idx] = attn_map
+        return x, attn_maps
+        
+    def forward(self, hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+        ):
+        x = xk = self.initialize_state(hidden_states)
+        if self.training:
+            num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
+        else:
+            if 'HUGINN_RECURRENT_STEP' not in os.environ:
+                raise ValueError("You must set the environment value-HUGINN_RECURRENT_STEP to set the number of iteration number\n Try: export HUGINN_RECURRENT_STEP=4")
+            num_steps_no_grad, num_steps_with_grad = torch.tensor(int(os.environ['HUGINN_RECURRENT_STEP'])), torch.tensor(0)
+        attn_maps = {}
+        with torch.no_grad():
+            for step in range(num_steps_no_grad):
+                xk = x
+                x, attn_maps = self.core_block_forward(
+                    xk, hidden_states, attn_maps = attn_maps,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value, output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position, position_embeddings=position_embeddings
+                )
+        for step in range(num_steps_with_grad):
+                xk = x
+                x, attn_maps = self.core_block_forward(
+                    xk, hidden_states, attn_maps = attn_maps,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value, output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position, position_embeddings=position_embeddings
+                )
+        
+        return self.ln_f(x), xk.detach(), attn_maps
+        
+        
+        
 class LlavaMiniMetaModel:
 
     def __init__(self, config):
         super(LlavaMiniMetaModel, self).__init__(config)
-
+        self.recurrent = None
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
@@ -186,6 +345,11 @@ class LlavaMiniMetaModel:
         if hasattr(config,'compressor_size'):
             self.build_compressor(config)
             self.init_build_compressor=True
+        
+        self.build_recurrent()
+
+    def build_recurrent(self, config):
+        self.recurrent = HuginnRecurrent(config)
 
     def build_compressor(self,config):
         self.prefusion_layer_num= getattr(config,'prefusion_layer_num', 4)
@@ -213,6 +377,9 @@ class LlavaMiniMetaModel:
             vision_tower = vision_tower[0]
         return vision_tower
 
+    def get_recurrent(self):
+        return self.recurrent
+
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
@@ -225,6 +392,8 @@ class LlavaMiniMetaModel:
         if not self.init_build_compressor:
             self.build_compressor(model_args)
             self.init_build_compressor=True
+            
+        self.build_recurrent(self.config)
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
@@ -264,6 +433,7 @@ class LlavaMiniMetaModel:
         for p in self.compressor.parameters():
             p.requires_grad = True
         self.compressor.init_weights()
+        
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')

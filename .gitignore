@@ -1,0 +1,8 @@
+/llava_mini.egg-info
+
+/playground/data/*
+
+/llava_reasoning/serve/*
+checkpoints/*
+*.pyc
+*.whl
