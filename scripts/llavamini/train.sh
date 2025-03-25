@@ -1,4 +1,6 @@
-deepspeed --include localhost:0,1,2,3 --master_port 13354 llavamini/train/train_mem.py \
+export HOME=/data3/tianlong
+
+deepspeed --include localhost:1 --master_port 13354 llavamini/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
     --model_name_or_path ICTNLP/llava-mini-llama-3-8b \
     --version llava_llama_3_1 \

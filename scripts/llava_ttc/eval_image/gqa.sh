@@ -1,10 +1,10 @@
 #!/bin/bash
-LLAVA_MINI_ROOT=$(pwd)
+LLAVA_MINI_ROOT=path_to_llama_mini_dir
 gpu_list="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
 
-model_path=$LLAVA_MINI_ROOT/checkpoints/llava-mini-llama-3.1-8b
+model_path=path_to_llava_mini_ckpt
 CKPT=$(basename "$CKPT")
 echo "Model path is set to: $model_path"
 

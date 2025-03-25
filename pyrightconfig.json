@@ -1,0 +1,3 @@
+{
+    "exclude": ["/playground/data", "/checkpoints", "/assets", "docs"]
+}

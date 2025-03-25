@@ -396,7 +396,7 @@ class LlavaMiniMetaModel:
         
         # set config
         self.config.norm_eps = model_args.norm_eps
-        self.config.n_layers_in_recurrent_block = n_layers_in_recurrent_block.norm_eps
+        self.config.n_layers_in_recurrent_block = model_args.n_layers_in_recurrent_block
         self.config.embed_scale = model_args.embed_scale
         self.config.init_values_std = model_args.init_values_std
         self.config.mean_recurrence = model_args.mean_recurrence
@@ -452,7 +452,7 @@ class LlavaMiniMetaModel:
             p.requires_grad = True
         self.compressor.init_weights()
         if self.recurrent is not None:
-            for p in self.recurrent:
+            for p in self.recurrent.parameters():
                 p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
@@ -556,10 +556,10 @@ class LlavaMiniMetaForCausalLM(ABC):
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
                 global_image_features=self.get_model().mm_projector(global_image_features)
 
-                if self.self.get_model().recurrent_in_prefusion:
+                if self.get_model().recurrent_in_prefusion:
                     global_image_features = self.get_model().recurrent(global_image_features)
                 
-                if self.self.get_model().recurrent_in_compression:
+                if self.get_model().recurrent_in_compression:
                     compressed_image_features = self.get_model().recurrent(compressed_image_features)
                 
                 x=torch.cat([global_image_features,compressed_image_features,text_embedding],dim=1)

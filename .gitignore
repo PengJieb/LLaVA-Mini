@@ -6,3 +6,6 @@
 checkpoints/*
 *.pyc
 *.whl
+*.pyc
+/llavamini_scaling/eval/*
+/llava_mini.egg-info
