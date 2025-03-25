@@ -1,6 +1,6 @@
 deepspeed --include localhost:0,1,2,3 --master_port 13354 llavamini/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
-    --model_name_or_path ICTNLP/llava-mini-llama-3-8b \
+    --model_name_or_path ICTNLP/llava-mini-llama-3.1-8b \
     --version llava_llama_3_1 \
     --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
@@ -33,5 +33,6 @@ deepspeed --include localhost:0,1,2,3 --master_port 13354 llavamini/train/train_
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
+    --recurrent_in_compression True \
     --report_to none
 

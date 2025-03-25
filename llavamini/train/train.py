@@ -76,6 +76,17 @@ class ModelArguments:
     resolution_ratio:int = field(default=2)
     prefusion_layer_num: Optional[int] = field(default=4)
 
+    # https://huggingface.co/tomg-group-umd/huginn-0125/blob/main/config.json
+    norm_eps:float = field(default=1e-6)
+    n_layers_in_recurrent_block:int = field(default=4)
+    embed_scale:float = field(default=72.6636084983398)
+    init_values_std:float = field(default=0.008703882797784892)
+    mean_recurrence:int = field(default=32)
+    mean_backprop_depth:int = field(default=8)
+    
+    recurrent_in_compression:bool = field(default=False)
+    recurrent_in_prefusion:bool = field(default=False)
+    recurrent_in_llm:bool = field(default=False)
 
 @dataclass
 class DataArguments:

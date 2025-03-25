@@ -346,11 +346,16 @@ class LlavaMiniMetaModel:
             self.build_compressor(config)
             self.init_build_compressor=True
         
-        self.build_recurrent()
+        self.build_recurrent(config)
+        self.recurrent_in_compression = config.recurrent_in_compression
+        self.recurrent_in_prefusion = config.recurrent_in_prefusion
 
     def build_recurrent(self, config):
-        self.recurrent = HuginnRecurrent(config)
-
+        if config.recurrent_in_compression or config.recurrent_in_prefusion:
+            self.recurrent = HuginnRecurrent(config)
+        else:
+            self.recurrent = None
+        
     def build_compressor(self,config):
         self.prefusion_layer_num= getattr(config,'prefusion_layer_num', 4)
         
@@ -388,6 +393,19 @@ class LlavaMiniMetaModel:
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
+        
+        # set config
+        self.config.norm_eps = model_args.norm_eps
+        self.config.n_layers_in_recurrent_block = n_layers_in_recurrent_block.norm_eps
+        self.config.embed_scale = model_args.embed_scale
+        self.config.init_values_std = model_args.init_values_std
+        self.config.mean_recurrence = model_args.mean_recurrence
+        self.config.mean_backprop_depth = model_args.mean_backprop_depth
+        self.config.recurrent_in_compression = model_args.recurrent_in_compression
+        self.config.recurrent_in_prefusion = model_args.recurrent_in_prefusion
+        self.config.recurrent_in_llm = model_args.recurrent_in_llm
+        self.recurrent_in_compression = model_args.recurrent_in_compression
+        self.recurrent_in_prefusion = model_args.recurrent_in_prefusion
 
         if not self.init_build_compressor:
             self.build_compressor(model_args)
@@ -433,7 +451,9 @@ class LlavaMiniMetaModel:
         for p in self.compressor.parameters():
             p.requires_grad = True
         self.compressor.init_weights()
-        
+        if self.recurrent is not None:
+            for p in self.recurrent:
+                p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
@@ -536,6 +556,12 @@ class LlavaMiniMetaForCausalLM(ABC):
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
                 global_image_features=self.get_model().mm_projector(global_image_features)
 
+                if self.self.get_model().recurrent_in_prefusion:
+                    global_image_features = self.get_model().recurrent(global_image_features)
+                
+                if self.self.get_model().recurrent_in_compression:
+                    compressed_image_features = self.get_model().recurrent(compressed_image_features)
+                
                 x=torch.cat([global_image_features,compressed_image_features,text_embedding],dim=1)
                 mask=torch.cat((torch.zeros((padding_mask.size(0),global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
 
