@@ -13,10 +13,14 @@
 #    limitations under the License.
 
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Callable
+from functools import partial
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
+
+from torch.utils.checkpoint import checkpoint
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
@@ -41,7 +45,30 @@ class LlavaMiniConfig(LlamaConfig):
     recurrent_in_compression = False
     recurrent_in_prefusion = False
     recurrent_in_llm = False
+    activation_checkpoint_impl = 'per-iteration'
+    
 
+
+    @property
+    def checkpoint(self) -> Callable:
+        """Run SAC at your own risk :<"""
+        attn_ops = [
+            torch.ops.aten._scaled_dot_product_efficient_attention.default,  # type: ignore
+            torch.ops.aten._scaled_dot_product_flash_attention.default,  # type: ignore
+        ]
+        try:
+            from flash_attn import flash_attn_func  # type: ignore
+
+            attn_ops.append(flash_attn_func)
+        except ImportError:
+            pass
+        ops_to_save = [
+            torch.ops.aten.mm.default,  # type: ignore
+            *attn_ops,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,  # type: ignore # from comms
+        ]
+
+        return partial(checkpoint, use_reentrant=False, preserve_rng_state=False, determinism_check="none")
 
 class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):
     config_class = LlavaMiniConfig

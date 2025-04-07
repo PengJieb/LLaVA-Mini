@@ -87,6 +87,8 @@ class ModelArguments:
     recurrent_in_compression:bool = field(default=False)
     recurrent_in_prefusion:bool = field(default=False)
     recurrent_in_llm:bool = field(default=False)
+    
+    activation_checkpoint_impl:str = field(default='per-iteration')
 
 @dataclass
 class DataArguments:
@@ -137,6 +139,8 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    
+    only_recurrent_trainable: bool = field(default=False)
     
 
 
@@ -1714,6 +1718,8 @@ def train(attn_implementation=None):
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
+        
+
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
         training_args.use_im_start_end = model_args.mm_use_im_start_end
@@ -1722,7 +1728,15 @@ def train(attn_implementation=None):
         model.config.prefusion_layer_num = model_args.prefusion_layer_num
         model.config.resolution_ratio = data_args.resolution_ratio = model_args.resolution_ratio
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
-
+        
+        if model.get_model().recurrent is not None:
+            model.get_model().recurrent.to(dtype=compute_dtype, device=training_args.device)
+            
+            if training_args.only_recurrent_trainable:
+                model.requires_grad_(False)
+                model.get_model().recurrent.requires_grad_(True)
+        
+        
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():

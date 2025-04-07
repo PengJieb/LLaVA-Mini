@@ -216,15 +216,17 @@ class SandwichBlock(torch.nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_out, attn_map = self.attn(self.norm_1(x), attention_mask=mask, 
+        # print(x)
+        # print(position_ids)
+        hidden_states, self_attn_weights, present_key_value = self.attn(self.norm_1(x), attention_mask=mask, 
                                        past_key_value = past_key_values, 
                                        output_attentions=return_attn,
                                        position_ids=position_ids,
                                        cache_position=cache_position,
                                        position_embeddings=position_embeddings)
-        x = self.norm_2(attn_out + x)
+        x = self.norm_2(hidden_states + x)
         x = self.norm_4(self.mlp(self.norm_3(x)) + x)
-        return x, attn_map
+        return x
 
 class HuginnRecurrent(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -240,8 +242,10 @@ class HuginnRecurrent(nn.Module):
         
     def initialize_state(self, input_embeds, deterministic: bool = False):
         x = torch.randn_like(input_embeds)
+        x_dtype = x.dtype
         std = self.config.init_values_std
-        torch.nn.init.trunc_normal_(x, mean=0.0, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(x.float(), mean=0.0, std=std, a=-3 * std, b=3 * std)
+        x = x.to(dtype=x_dtype)
         if self.emb_scale != 1:
             x = x * self.emb_scale
         return x if not deterministic else x.zero_()
@@ -278,11 +282,11 @@ class HuginnRecurrent(nn.Module):
     ):
         x = self.adapter(torch.cat([x, hidden_states.to(x.device)], dim=-1))
         for idx, block in enumerate(self.core_block, start=1):
-            x, attn_map = block(x, attention_mask=attention_mask, past_key_value=past_key_value,
+            x = block(x, mask=attention_mask, past_key_values=past_key_value,
                                 return_attn=output_attentions, position_ids=position_ids,
                                 cache_position=cache_position, position_embeddings=position_embeddings)
-            attn_maps[idx] = attn_map
-        return x, attn_maps
+            attn_maps[idx] = None
+        return x
         
     def forward(self, hidden_states: torch.Tensor,
         attention_mask: Optional[torch.LongTensor] = None,
@@ -294,6 +298,16 @@ class HuginnRecurrent(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
         ):
         x = xk = self.initialize_state(hidden_states)
+        
+        if cache_position is None:
+            past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+            )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0).to(device=hidden_states.device)
+        
+        
         if self.training:
             num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
         else:
@@ -304,7 +318,7 @@ class HuginnRecurrent(nn.Module):
         with torch.no_grad():
             for step in range(num_steps_no_grad):
                 xk = x
-                x, attn_maps = self.core_block_forward(
+                x = self.core_block_forward(
                     xk, hidden_states, attn_maps = attn_maps,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -314,16 +328,23 @@ class HuginnRecurrent(nn.Module):
                 )
         for step in range(num_steps_with_grad):
                 xk = x
-                x, attn_maps = self.core_block_forward(
-                    xk, hidden_states, attn_maps = attn_maps,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value, output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position, position_embeddings=position_embeddings
-                )
+                if 'per-iteration' in self.config.activation_checkpoint_impl and self.training:
+                    x = self.config.checkpoint(
+                        self.core_block_forward, xk, hidden_states, attn_maps, attention_mask,
+                        position_ids, past_key_value, output_attentions, use_cache,
+                        cache_position, position_embeddings
+                    )
+                else:
+                    x = self.core_block_forward(
+                        xk, hidden_states, attn_maps = attn_maps,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value, output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position, position_embeddings=position_embeddings
+                    )
         
-        return self.ln_f(x), xk.detach(), attn_maps
+        return self.ln_f(x), xk.detach()
         
         
         
@@ -557,10 +578,10 @@ class LlavaMiniMetaForCausalLM(ABC):
                 global_image_features=self.get_model().mm_projector(global_image_features)
 
                 if self.get_model().recurrent_in_prefusion:
-                    global_image_features = self.get_model().recurrent(global_image_features)
+                    global_image_features = self.get_model().recurrent(global_image_features)[0]
                 
                 if self.get_model().recurrent_in_compression:
-                    compressed_image_features = self.get_model().recurrent(compressed_image_features)
+                    compressed_image_features = self.get_model().recurrent(compressed_image_features)[0]
                 
                 x=torch.cat([global_image_features,compressed_image_features,text_embedding],dim=1)
                 mask=torch.cat((torch.zeros((padding_mask.size(0),global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
