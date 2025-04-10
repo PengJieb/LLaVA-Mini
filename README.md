@@ -136,3 +136,11 @@ If this repository is useful for you, please cite as:
 ```
 
 If you have any questions, please feel free to submit an issue or contact `zhangshaolei20z@ict.ac.cn`.
+
+
+
+# LLaVA TTC
+
+`--recurrent_in_llm True`: recurrent in the middle of LLM
+`--recurrent_in_prefusion_residue True`: recurrent as the residue of prefusion
+`--recurrent_in_llm_residue True`: recurrent as the residue at the middle of LLM, the residule input at n_layer//2-recurrent_in_llm_range, and output add at n_layer//2+recurrent_in_llm_range, n_layer is the layer number of transformer decoder layer in LLM
