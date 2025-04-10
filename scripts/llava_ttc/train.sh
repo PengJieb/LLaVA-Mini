@@ -1,7 +1,7 @@
 export HOME=/data3/tianlong
 #  GIT_SSH_COMMAND="ssh -i  /data3/tianlong/.ssh/id_ed25519" git push -u origin dev
 
-deepspeed --include localhost:0,1,2,3 --master_port 13354 llavamini/train/train_mem.py \
+deepspeed --include localhost:0,1 --master_port 13354 llavamini/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path ICTNLP/llava-mini-llama-3.1-8b \
     --version llava_llama_3_1 \
@@ -16,7 +16,7 @@ deepspeed --include localhost:0,1,2,3 --master_port 13354 llavamini/train/train_
     --mm_use_im_patch_token False \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/compression \
+    --output_dir ./checkpoints/in_llm \
     --num_train_epochs 2 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 8 \
@@ -36,7 +36,9 @@ deepspeed --include localhost:0,1,2,3 --master_port 13354 llavamini/train/train_
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
-    --recurrent_in_compression True \
+    --recurrent_in_compression False \
     --only_recurrent_trainable True \
+    --recurrent_in_llm_residue True \
+    --recurrent_in_llm_range 6 \
     --report_to none
 

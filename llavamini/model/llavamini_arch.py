@@ -370,9 +370,10 @@ class LlavaMiniMetaModel:
         self.build_recurrent(config)
         self.recurrent_in_compression = config.recurrent_in_compression
         self.recurrent_in_prefusion = config.recurrent_in_prefusion
+        self.recurrent_in_prefusion_residue = config.recurrent_in_prefusion_residue
 
     def build_recurrent(self, config):
-        if config.recurrent_in_compression or config.recurrent_in_prefusion:
+        if config.recurrent_in_compression or config.recurrent_in_prefusion or config.recurrent_in_prefusion_residue:
             self.recurrent = HuginnRecurrent(config)
         else:
             self.recurrent = None
@@ -425,8 +426,10 @@ class LlavaMiniMetaModel:
         self.config.recurrent_in_compression = model_args.recurrent_in_compression
         self.config.recurrent_in_prefusion = model_args.recurrent_in_prefusion
         self.config.recurrent_in_llm = model_args.recurrent_in_llm
+        self.config.recurrent_in_prefusion_residue = model_args.recurrent_in_prefusion_residue
         self.recurrent_in_compression = model_args.recurrent_in_compression
         self.recurrent_in_prefusion = model_args.recurrent_in_prefusion
+        self.recurrent_in_prefusion_residue = model_args.recurrent_in_prefusion_residue
 
         if not self.init_build_compressor:
             self.build_compressor(model_args)
@@ -583,6 +586,9 @@ class LlavaMiniMetaForCausalLM(ABC):
                 if self.get_model().recurrent_in_compression:
                     compressed_image_features = self.get_model().recurrent(compressed_image_features)[0]
                 
+                # if self.get_model().recurrent_in_prefusion_residue:
+                #     global_image_features += self.get_model().recurrent(clip_image_features)[0]
+                
                 x=torch.cat([global_image_features,compressed_image_features,text_embedding],dim=1)
                 mask=torch.cat((torch.zeros((padding_mask.size(0),global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
 
@@ -623,10 +629,17 @@ class LlavaMiniMetaForCausalLM(ABC):
             position_ids.masked_fill_((~mask).int() == 0, 1)
             
 
+            if self.get_model().recurrent_in_prefusion_residue:
+                # print("recurrent_in_prefusion_residue")
+                recurrent_out = self.get_model().recurrent(x,attention_mask=attention_mask,position_ids=position_ids)[0]
+            
             # modality pre-fusion
             for layer in self.get_model().prefusion_layers:
                 x = layer(x,attention_mask=attention_mask,position_ids=position_ids)[0]
 
+            if self.get_model().recurrent_in_prefusion_residue:
+                x += recurrent_out
+            
             fusion_text_features=x[:,-1*input_ids.size(1):,:]
             compressed_image_features=x[:,-1*input_ids.size(1)-1*compressed_image_features.size(1):-1*input_ids.size(1),:]
             fusion_text_features=fusion_text_features*(~padding_mask).unsqueeze(-1).int()+all_text_embedding*padding_mask.unsqueeze(-1)

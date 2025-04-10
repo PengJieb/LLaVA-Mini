@@ -86,7 +86,10 @@ class ModelArguments:
     
     recurrent_in_compression:bool = field(default=False)
     recurrent_in_prefusion:bool = field(default=False)
+    recurrent_in_prefusion_residue:bool = field(default=False)
     recurrent_in_llm:bool = field(default=False)
+    recurrent_in_llm_residue:bool = field(default=False)
+    recurrent_in_llm_range:int = field(default=4)
     
     activation_checkpoint_impl:str = field(default='per-iteration')
 
@@ -1549,7 +1552,9 @@ def train(attn_implementation=None):
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
-    bnb_model_from_pretrained_args = {}
+    bnb_model_from_pretrained_args = {"recurrent_in_llm": model_args.recurrent_in_llm, 
+                                      "recurrent_in_llm_residue": model_args.recurrent_in_llm_residue, 
+                                      "recurrent_in_llm_range": model_args.recurrent_in_llm_range}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
         bnb_model_from_pretrained_args.update(dict(
@@ -1726,7 +1731,9 @@ def train(attn_implementation=None):
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.config.compressor_size = model_args.compressor_size
         model.config.prefusion_layer_num = model_args.prefusion_layer_num
+        model.config.recurrent_in_llm_range = model_args.recurrent_in_llm_range
         model.config.resolution_ratio = data_args.resolution_ratio = model_args.resolution_ratio
+        
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
         
         if model.get_model().recurrent is not None:
@@ -1735,6 +1742,13 @@ def train(attn_implementation=None):
             if training_args.only_recurrent_trainable:
                 model.requires_grad_(False)
                 model.get_model().recurrent.requires_grad_(True)
+        # print(type(model.model))
+        if model.model.recurrent_in_llm or model.model.recurrent_in_llm_residue:
+            # print("Recurrent in LLM")
+            model.model.create_recurrent_in_llm()
+            if training_args.only_recurrent_trainable:
+                model.requires_grad_(False)
+                model.model.llm_recurrent.requires_grad_(True)
         
         
     if training_args.bits in [4, 8]:
