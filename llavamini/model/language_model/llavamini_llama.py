@@ -32,7 +32,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
 
 
-from ..llavamini_arch import LlavaMiniMetaModel, LlavaMiniMetaForCausalLM, HuginnRecurrent, MyRecurrent
+from ..llavamini_arch import LlavaMiniMetaModel, LlavaMiniMetaForCausalLM, MyRecurrent
 import time
 
 logger = logging.get_logger(__name__)
