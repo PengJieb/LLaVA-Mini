@@ -75,6 +75,7 @@ class ModelArguments:
     compressor_size: Optional[int] = field(default=2)
     resolution_ratio:int = field(default=2)
     prefusion_layer_num: Optional[int] = field(default=4)
+    reinit_projector: Optional[bool] = field(default=False)
 
     # https://huggingface.co/tomg-group-umd/huginn-0125/blob/main/config.json
     norm_eps:float = field(default=1e-6)
@@ -86,10 +87,14 @@ class ModelArguments:
     
     recurrent_in_compression:bool = field(default=False)
     recurrent_in_prefusion:bool = field(default=False)
+    recurrent_as_prefusion:bool = field(default=False)
+    recurrent_with_tcond:bool = field(default=False)
     recurrent_in_prefusion_residue:bool = field(default=False)
     recurrent_in_llm:bool = field(default=False)
     recurrent_in_llm_residue:bool = field(default=False)
     recurrent_in_llm_range:int = field(default=4)
+    recurrent_as_llm:bool = field(default=False)
+    recurrent_start_idx:int = field(default=28)
     
     activation_checkpoint_impl:str = field(default='per-iteration')
 
@@ -1554,7 +1559,9 @@ def train(attn_implementation=None):
 
     bnb_model_from_pretrained_args = {"recurrent_in_llm": model_args.recurrent_in_llm, 
                                       "recurrent_in_llm_residue": model_args.recurrent_in_llm_residue, 
-                                      "recurrent_in_llm_range": model_args.recurrent_in_llm_range}
+                                      "recurrent_in_llm_range": model_args.recurrent_in_llm_range,
+                                      "recurrent_as_llm": model_args.recurrent_as_llm,
+                                      "recurrent_start_idx": model_args.recurrent_start_idx}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
         bnb_model_from_pretrained_args.update(dict(
@@ -1685,8 +1692,16 @@ def train(attn_implementation=None):
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
+        # for continue
+        # model = model.from_pretrained('./checkpoints/recasprefusion_mean4rec_lr3e-5_4l_sub66.5k')
+
         vision_tower = model.get_vision_tower()
+
+        # for continue
+        # if not vision_tower.is_loaded:
+        #     vision_tower.load_model(device_map=training_args.device)
+
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
@@ -1732,10 +1747,13 @@ def train(attn_implementation=None):
         model.config.compressor_size = model_args.compressor_size
         model.config.prefusion_layer_num = model_args.prefusion_layer_num
         model.config.recurrent_in_llm_range = model_args.recurrent_in_llm_range
+        model.config.recurrent_as_llm = model_args.recurrent_as_llm
+        model.config.recurrent_start_idx = model_args.recurrent_start_idx
         model.config.resolution_ratio = data_args.resolution_ratio = model_args.resolution_ratio
         
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
         
+
         if model.get_model().recurrent is not None:
             model.get_model().recurrent.to(dtype=compute_dtype, device=training_args.device)
             
@@ -1743,12 +1761,17 @@ def train(attn_implementation=None):
                 model.requires_grad_(False)
                 model.get_model().recurrent.requires_grad_(True)
         # print(type(model.model))
-        if model.model.recurrent_in_llm or model.model.recurrent_in_llm_residue:
+        if model.model.recurrent_as_prefusion:
+            model.requires_grad_(False)
+            model.get_model().prefusion_layers.requires_grad_(True)
+        if model.model.recurrent_in_llm or model.model.recurrent_in_llm_residue or model.model.recurrent_as_llm:
             # print("Recurrent in LLM")
             model.model.create_recurrent_in_llm()
             if training_args.only_recurrent_trainable:
                 model.requires_grad_(False)
                 model.model.llm_recurrent.requires_grad_(True)
+                # model.model.layers[-1].requires_grad_(True)
+                # model.lm_head.requires_grad_(True)
         
         
     if training_args.bits in [4, 8]:

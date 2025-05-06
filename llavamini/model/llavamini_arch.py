@@ -15,6 +15,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Optional, Union, Any, Tuple
+from collections import OrderedDict
 
 import torch
 import math
@@ -30,7 +31,7 @@ from llavamini.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_P
 
 from llavamini.mm_utils import get_anyres_image_grid_shape
 
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP, LlamaRMSNorm
 from transformers import LlamaConfig, LlamaModel, LlamaForCausalLM
 
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
@@ -175,71 +176,210 @@ class Resampler(nn.Module):
         return query.unsqueeze(1).repeat(1, N, 1)
 
 
-class RMSNorm(torch.nn.Module):
-    """Saner dtype handling and slightly better for fusion"""
+# class RMSNorm(torch.nn.Module):
+#     """Saner dtype handling and slightly better for fusion"""
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+#     def __init__(self, dim: int, eps: float = 1e-6):
+#         super().__init__()
+#         self.eps = eps
+#         self.weight = torch.nn.Parameter(torch.ones(dim))
+
+#     def _norm(self, x):
+#         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+#     def forward(self, x):
+#         with torch.autocast(enabled=False, device_type=x.device.type if x.device.type != "meta" else "cuda"):
+#             return self._norm(x.float()).type_as(x) * self.weight
+
+#     def reset_parameters(self) -> None:
+#         torch.nn.init.ones_(self.weight)
+
+class MyLlamaRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
         super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    def forward(self, hidden_states, scale=None):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        if scale is None:
+            return self.weight * hidden_states.to(input_dtype)
+        else:
+            weight = self.weight + scale.squeeze(0)
+            return weight * hidden_states.to(input_dtype)
 
-    def forward(self, x):
-        with torch.autocast(enabled=False, device_type=x.device.type if x.device.type != "meta" else "cuda"):
-            return self._norm(x.float()).type_as(x) * self.weight
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
-    def reset_parameters(self) -> None:
-        torch.nn.init.ones_(self.weight)
 
-class SandwichBlock(torch.nn.Module):
-    expanded = False
 
-    def __init__(self, config: LlamaConfig, layer_id: int) -> None:
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        self.norm_1 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-        self.attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_id)
-        self.norm_2 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-        self.mlp = LlamaMLP(config)
-        self.norm_3 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-        self.norm_4 = RMSNorm(config.hidden_size, eps=config.norm_eps)
-        self.layer_id = layer_id
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        dtype = t.dtype
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq.to(dtype))
+        return t_emb
+
+
+class MyLlamaDecoderLayer(LlamaDecoderLayer):
+    def __init__(self, config: LlamaConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+
+        self.adaNorm_modulation_input = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        )
+        self.adaNorm_modulation_post = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        )
+        self.input_layernorm = MyLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MyLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        nn.init.constant_(self.adaNorm_modulation_input[-1].weight, 0)
+        nn.init.constant_(self.adaNorm_modulation_input[-1].bias, 0)
+        nn.init.constant_(self.adaNorm_modulation_post[-1].weight, 0)
+        nn.init.constant_(self.adaNorm_modulation_post[-1].bias, 0)
 
     def forward(
         self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        return_attn: bool = False,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # print(x)
-        # print(position_ids)
-        hidden_states, self_attn_weights, present_key_value = self.attn(self.norm_1(x), attention_mask=mask, 
-                                       past_key_value = past_key_values, 
-                                       output_attentions=return_attn,
-                                       position_ids=position_ids,
-                                       cache_position=cache_position,
-                                       position_embeddings=position_embeddings)
-        x = self.norm_2(hidden_states + x)
-        x = self.norm_4(self.mlp(self.norm_3(x)) + x)
-        return x
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+        condition: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
 
-class HuginnRecurrent(nn.Module):
+        if condition is not None:
+            scale_input = self.adaNorm_modulation_input(condition)
+            hidden_states = self.input_layernorm(hidden_states, scale_input)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        if condition is not None:
+            scale_post = self.adaNorm_modulation_post(condition)
+            hidden_states = self.post_attention_layernorm(hidden_states, scale_post)
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
+
+
+class MyRecurrent(torch.nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
-        self.core_block = torch.nn.ModuleList(
-            SandwichBlock(config, layer_id=i)
-            for i in range(config.n_layers_in_recurrent_block)
+        self.core_block = nn.ModuleList(
+            [MyLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.n_layers_in_recurrent_block)]
         )
+        self.pre_adapter = None
+
         self.adapter = torch.nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.emb_scale=config.embed_scale
-        self.ln_f = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        if config.recurrent_as_prefusion or config.recurrent_as_llm or config.recurrent_in_prefusion_residue:
+            self.ln_f = nn.Identity()
+        else:
+            self.ln_f = LlamaRMSNorm(config.hidden_size, eps=config.norm_eps)
         
+        if config.recurrent_in_prefusion_residue:
+            self.proj_out = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        else:
+            self.proj_out = None
+
+        self.t_embedder = TimestepEmbedder(config.hidden_size) if config.recurrent_with_tcond else None
+        self._init_weight()
+     
+    def _init_weight(self):
+        if self.config.recurrent_as_prefusion or self.config.recurrent_as_llm or self.config.recurrent_in_prefusion_residue:
+            if self.config.recurrent_as_prefusion and self.pre_adapter is not None:
+                self.pre_adapter.weight.data[:] = 0 # torch.eye(self.config.hidden_size, dtype=self.pre_adapter.weight.dtype, device=self.pre_adapter.weight.device)
+
+            self.adapter.weight.data[:, :self.config.hidden_size] = 0
+            self.adapter.weight.data[:, self.config.hidden_size:] = torch.eye(self.config.hidden_size, dtype=self.adapter.weight.dtype, device=self.adapter.weight.device)
+        if self.config.recurrent_in_prefusion_residue:
+            self.proj_out.weight.data[:] = 0
+
+
+        if self.config.recurrent_with_tcond:
+            nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        # for m in self.modules():
+        #     if isinstance(m, nn.Linear):
+        #         trunc_normal_(m.weight, std=0.002)
+        #         if m.bias is not None:
+        #             nn.init.constant_(m.bias, 0)
+
     def initialize_state(self, input_embeds, deterministic: bool = False):
         x = torch.randn_like(input_embeds)
         x_dtype = x.dtype
@@ -279,13 +419,21 @@ class HuginnRecurrent(nn.Module):
                             use_cache: bool = False,
                             cache_position: Optional[torch.LongTensor] = None,
                             position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45)
+                            condition: Optional[torch.Tensor] = None,
     ):
-        x = self.adapter(torch.cat([x, hidden_states.to(x.device)], dim=-1))
+        x = self.adapter(torch.cat([x.to(hidden_states.device), hidden_states], dim=-1))
         for idx, block in enumerate(self.core_block, start=1):
-            x = block(x, mask=attention_mask, past_key_values=past_key_value,
-                                return_attn=output_attentions, position_ids=position_ids,
-                                cache_position=cache_position, position_embeddings=position_embeddings)
-            attn_maps[idx] = None
+            x = block(
+                x,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                condition=condition
+            )[0]
         return x
         
     def forward(self, hidden_states: torch.Tensor,
@@ -315,8 +463,14 @@ class HuginnRecurrent(nn.Module):
                 raise ValueError("You must set the environment value-HUGINN_RECURRENT_STEP to set the number of iteration number\n Try: export HUGINN_RECURRENT_STEP=4")
             num_steps_no_grad, num_steps_with_grad = torch.tensor(int(os.environ['HUGINN_RECURRENT_STEP'])), torch.tensor(0)
         attn_maps = {}
+        if self.pre_adapter is not None:
+            x = self.pre_adapter(hidden_states) + x # form initial state rather than using pure noise, currently only use if 'recurrent_as_prefusion' is true
         with torch.no_grad():
             for step in range(num_steps_no_grad):
+                if self.t_embedder is not None:
+                    step_embed = self.t_embedder(torch.tensor([step], dtype=hidden_states.dtype, device=hidden_states.device))
+                else:
+                    step_embed = None
                 xk = x
                 x = self.core_block_forward(
                     xk, hidden_states, attn_maps = attn_maps,
@@ -324,15 +478,20 @@ class HuginnRecurrent(nn.Module):
                     position_ids=position_ids,
                     past_key_value=past_key_value, output_attentions=output_attentions,
                     use_cache=use_cache,
-                    cache_position=cache_position, position_embeddings=position_embeddings
+                    cache_position=cache_position, position_embeddings=position_embeddings,
+                    condition=step_embed
                 )
         for step in range(num_steps_with_grad):
+                if self.t_embedder is not None:
+                    step_embed = self.t_embedder(torch.tensor([step+num_steps_no_grad], dtype=hidden_states.dtype, device=hidden_states.device))
+                else:
+                    step_embed = None
                 xk = x
                 if 'per-iteration' in self.config.activation_checkpoint_impl and self.training:
                     x = self.config.checkpoint(
                         self.core_block_forward, xk, hidden_states, attn_maps, attention_mask,
                         position_ids, past_key_value, output_attentions, use_cache,
-                        cache_position, position_embeddings
+                        cache_position, position_embeddings, step_embed
                     )
                 else:
                     x = self.core_block_forward(
@@ -341,10 +500,182 @@ class HuginnRecurrent(nn.Module):
                         position_ids=position_ids,
                         past_key_value=past_key_value, output_attentions=output_attentions,
                         use_cache=use_cache,
-                        cache_position=cache_position, position_embeddings=position_embeddings
+                        cache_position=cache_position, position_embeddings=position_embeddings,
+                        condition=step_embed
                     )
         
+        if self.proj_out is not None:
+            x = self.proj_out(x)
         return self.ln_f(x), xk.detach()
+
+# class SandwichBlock(torch.nn.Module):
+#     expanded = False
+
+#     def __init__(self, config: LlamaConfig, layer_id: int) -> None:
+#         super().__init__()
+#         self.norm_1 = LlamaRMSNorm(config.hidden_size, eps=config.norm_eps)
+#         self.attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_id)
+#         if config.recurrent_as_prefusion or config.recurrent_as_llm:
+#             self.norm_2 = nn.Identity()
+#         else:
+#             self.norm_2 = LlamaRMSNorm(config.hidden_size, eps=config.norm_eps) 
+#         self.mlp = LlamaMLP(config)
+#         self.norm_3 = LlamaRMSNorm(config.hidden_size, eps=config.norm_eps)
+#         if config.recurrent_as_prefusion or config.recurrent_as_llm:
+#             self.norm_4 = nn.Identity()
+#         else:
+#             self.norm_4 = LlamaRMSNorm(config.hidden_size, eps=config.norm_eps) 
+#         self.layer_id = layer_id
+
+#     def forward(
+#         self,
+#         x: torch.Tensor,
+#         mask: Optional[torch.Tensor] = None,
+#         past_key_values: Optional[Cache] = None,
+#         return_attn: bool = False,
+#         position_ids: Optional[torch.LongTensor] = None,
+#         cache_position: Optional[torch.LongTensor] = None,
+#         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+#     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+#         # print(x)
+#         # print(position_ids)
+#         hidden_states, self_attn_weights, present_key_value = self.attn(self.norm_1(x), attention_mask=mask, 
+#                                        past_key_value = past_key_values, 
+#                                        output_attentions=return_attn,
+#                                        position_ids=position_ids,
+#                                        cache_position=cache_position,
+#                                        position_embeddings=position_embeddings)
+#         x = self.norm_2(hidden_states + x)
+#         x = self.norm_4(self.mlp(self.norm_3(x)) + x)
+#         return x
+
+# class HuginnRecurrent(nn.Module):
+#     def __init__(self, config: LlamaConfig):
+#         super().__init__()
+#         self.config = config
+#         self.core_block = torch.nn.ModuleList(
+#             SandwichBlock(config, layer_id=i)
+#             for i in range(config.n_layers_in_recurrent_block)
+#         )
+#         # self.pre_adapter = torch.nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False) 
+#         self.adapter = torch.nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+#         self.emb_scale=config.embed_scale
+#         self.ln_f = LlamaRMSNorm(config.hidden_size, eps=config.norm_eps) if not config.recurrent_as_prefusion else nn.Identity()
+#         # self._init_weight()
+    
+#     def _init_weight(self):
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear):
+#                 trunc_normal_(m.weight, std=0.002)
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+
+#     def initialize_state(self, input_embeds, deterministic: bool = False):
+#         x = torch.randn_like(input_embeds)
+#         x_dtype = x.dtype
+#         std = self.config.init_values_std
+#         torch.nn.init.trunc_normal_(x.float(), mean=0.0, std=std, a=-3 * std, b=3 * std)
+#         x = x.to(dtype=x_dtype)
+#         if self.emb_scale != 1:
+#             x = x * self.emb_scale
+#         return x if not deterministic else x.zero_()
+        
+#     @torch._dynamo.disable(recursive=False)  # type: ignore
+#     def randomized_iteration_sampler(self) -> tuple[torch.Tensor, torch.Tensor]:
+#         """Outputs are long tensors so that they can be passed through compiled functions"""
+#         t = max(self.config.mean_recurrence - self.config.mean_backprop_depth, 0)
+#         s = self.config.mean_backprop_depth
+#         if torch.rand((1,)).is_meta:  # annoying clause to make meta-tensor-based flop counting work
+#             # these values are only the mean TFLOPs of the randomized sampler
+#             # Note that this clause also breaks the contract, and returns ints in meta tensor mode
+#             return t, s  # type: ignore
+#         if self.training:
+#             sigma = 0.5
+#             mu = math.log(t + s) - (sigma**2 / 2)
+#             rate = torch.zeros((1,)).log_normal_(mean=mu, std=sigma)
+#             p = torch.poisson(torch.tensor([rate], dtype=torch.float)) + 1
+#             n = torch.clamp(p - s, min=0)
+#             k = torch.as_tensor(torch.minimum(torch.as_tensor(s), p))
+#         else:
+#             n, k = torch.as_tensor(self.config.mean_recurrence), torch.as_tensor(0)
+
+#         return n.to(dtype=torch.long), k.to(dtype=torch.long)
+        
+#     def core_block_forward(self, x, hidden_states,  attn_maps: dict = {},
+#                            attention_mask: Optional[torch.Tensor] = None,
+#                             position_ids: Optional[torch.LongTensor] = None,
+#                             past_key_value: Optional[Cache] = None,
+#                             output_attentions: bool = False,
+#                             use_cache: bool = False,
+#                             cache_position: Optional[torch.LongTensor] = None,
+#                             position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45)
+#     ):
+#         x = self.adapter(torch.cat([x, hidden_states.to(x.device)], dim=-1))
+#         for idx, block in enumerate(self.core_block, start=1):
+#             x = block(x, mask=attention_mask, past_key_values=past_key_value,
+#                                 return_attn=output_attentions, position_ids=position_ids,
+#                                 cache_position=cache_position, position_embeddings=position_embeddings)
+#             attn_maps[idx] = None
+#         return x
+        
+#     def forward(self, hidden_states: torch.Tensor,
+#         attention_mask: Optional[torch.LongTensor] = None,
+#         position_ids: Optional[torch.LongTensor] = None,
+#         past_key_value: Optional[Cache] = None,
+#         output_attentions: bool = False,
+#         use_cache: bool = False,
+#         cache_position: Optional[torch.LongTensor] = None,
+#         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+#         ):
+#         x = xk = self.initialize_state(hidden_states)
+        
+#         if cache_position is None:
+#             past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+#             cache_position = torch.arange(
+#                 past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+#             )
+#         if position_ids is None:
+#             position_ids = cache_position.unsqueeze(0).to(device=hidden_states.device)
+        
+        
+#         if self.training:
+#             num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
+#         else:
+#             if 'HUGINN_RECURRENT_STEP' not in os.environ:
+#                 raise ValueError("You must set the environment value-HUGINN_RECURRENT_STEP to set the number of iteration number\n Try: export HUGINN_RECURRENT_STEP=4")
+#             num_steps_no_grad, num_steps_with_grad = torch.tensor(int(os.environ['HUGINN_RECURRENT_STEP'])), torch.tensor(0)
+#         attn_maps = {}
+#         # xk = x = self.pre_adapter(torch.cat([x, hidden_states.to(x.device)], dim=-1)) # form initial state rather than using pure noise, currently only use if 'recurrent_as_prefusion' is true
+#         with torch.no_grad():
+#             for step in range(num_steps_no_grad):
+#                 xk = x
+#                 x = self.core_block_forward(
+#                     xk, hidden_states, attn_maps = attn_maps,
+#                     attention_mask=attention_mask,
+#                     position_ids=position_ids,
+#                     past_key_value=past_key_value, output_attentions=output_attentions,
+#                     use_cache=use_cache,
+#                     cache_position=cache_position, position_embeddings=position_embeddings
+#                 )
+#         for step in range(num_steps_with_grad):
+#                 xk = x
+#                 if 'per-iteration' in self.config.activation_checkpoint_impl and self.training:
+#                     x = self.config.checkpoint(
+#                         self.core_block_forward, xk, hidden_states, attn_maps, attention_mask,
+#                         position_ids, past_key_value, output_attentions, use_cache,
+#                         cache_position, position_embeddings
+#                     )
+#                 else:
+#                     x = self.core_block_forward(
+#                         xk, hidden_states, attn_maps = attn_maps,
+#                         attention_mask=attention_mask,
+#                         position_ids=position_ids,
+#                         past_key_value=past_key_value, output_attentions=output_attentions,
+#                         use_cache=use_cache,
+#                         cache_position=cache_position, position_embeddings=position_embeddings
+#                     )
+        
+#         return self.ln_f(x), xk.detach()
         
         
         
@@ -371,10 +702,28 @@ class LlavaMiniMetaModel:
         self.recurrent_in_compression = config.recurrent_in_compression
         self.recurrent_in_prefusion = config.recurrent_in_prefusion
         self.recurrent_in_prefusion_residue = config.recurrent_in_prefusion_residue
+        self.recurrent_as_prefusion = config.recurrent_as_prefusion
+        self.recurrent_with_tcond = config.recurrent_with_tcond
 
     def build_recurrent(self, config):
         if config.recurrent_in_compression or config.recurrent_in_prefusion or config.recurrent_in_prefusion_residue:
-            self.recurrent = HuginnRecurrent(config)
+            self.recurrent = MyRecurrent(config)
+        elif config.recurrent_as_prefusion:
+            recurrent = MyRecurrent(config)
+            prefusion_state_dict = self.prefusion_layers.state_dict()
+            new_dict = OrderedDict()
+            for k, v in prefusion_state_dict.items():
+                if 'norm' not in k:
+                    new_dict['core_block.'+k] = v
+                elif 'input' in k:
+                    new_dict['core_block.'+k] = v
+                elif 'post' in k:
+                    new_dict['core_block.'+k] = v
+                else:
+                    print(f'{k} not match')
+            recurrent.load_state_dict(new_dict, strict=False)
+            self.prefusion_layers = recurrent
+
         else:
             self.recurrent = None
         
@@ -425,11 +774,17 @@ class LlavaMiniMetaModel:
         self.config.mean_backprop_depth = model_args.mean_backprop_depth
         self.config.recurrent_in_compression = model_args.recurrent_in_compression
         self.config.recurrent_in_prefusion = model_args.recurrent_in_prefusion
+        self.config.recurrent_as_prefusion = model_args.recurrent_as_prefusion
+        self.config.recurrent_with_tcond = model_args.recurrent_with_tcond
         self.config.recurrent_in_llm = model_args.recurrent_in_llm
         self.config.recurrent_in_prefusion_residue = model_args.recurrent_in_prefusion_residue
+        self.config.recurrent_as_llm = model_args.recurrent_as_llm
+        self.config.recurrent_start_idx = model_args.recurrent_start_idx
         self.recurrent_in_compression = model_args.recurrent_in_compression
         self.recurrent_in_prefusion = model_args.recurrent_in_prefusion
         self.recurrent_in_prefusion_residue = model_args.recurrent_in_prefusion_residue
+        self.recurrent_as_prefusion = model_args.recurrent_as_prefusion
+        self.recurrent_with_tcond = model_args.recurrent_with_tcond
 
         if not self.init_build_compressor:
             self.build_compressor(model_args)
@@ -458,49 +813,54 @@ class LlavaMiniMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
-        if getattr(self, 'mm_projector', None) is None:
-            self.mm_projector = build_vision_projector(self.config)
+        if getattr(model_args, 'reinit_projector', False):
+            print('reinit projector !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+            if getattr(self, 'mm_projector', None) is None:
+                self.mm_projector = build_vision_projector(self.config)
 
-            if 'unpad' in mm_patch_merge_type:
-                embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
-                self.image_newline = nn.Parameter(
-                    torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
-                )
-        else:
-            self.mm_projector = build_vision_projector(self.config)
-            # In case it is frozen by LoRA
-            for p in self.mm_projector.parameters():
+                if 'unpad' in mm_patch_merge_type:
+                    embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
+                    self.image_newline = nn.Parameter(
+                        torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
+                    )
+            else:
+                self.mm_projector = build_vision_projector(self.config)
+                # In case it is frozen by LoRA
+                for p in self.mm_projector.parameters():
+                    p.requires_grad = True
+
+            for p in self.compressor.parameters():
                 p.requires_grad = True
+            self.compressor.init_weights()
+            if self.recurrent is not None:
+                for p in self.recurrent.parameters():
+                    p.requires_grad = True
 
-        for p in self.compressor.parameters():
-            p.requires_grad = True
-        self.compressor.init_weights()
-        if self.recurrent is not None:
-            for p in self.recurrent.parameters():
-                p.requires_grad = True
+            if pretrain_mm_mlp_adapter is not None:
+                mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
+                def get_w(weights, keyword):
+                    return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
-        if pretrain_mm_mlp_adapter is not None:
-            mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
-            def get_w(weights, keyword):
-                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+                print(self.mm_projector)
+                self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
-            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+                if 'base_model.model.model.prefusion_layers.0.self_attn.q_proj.weight' in mm_projector_weights.keys():
+                    for name, module in self.spatial_w_text_projector.named_parameters():
+                        module.data=mm_projector_weights[f"base_model.model.model.prefusion_layers.{name}"].data.type_as(module.data)
+                        # module.requires_grad = False
+                    self.load_spatial_w_text_projector=True
+                    print("load pretrained prefusion_layers")
 
-            if 'base_model.model.model.prefusion_layers.0.self_attn.q_proj.weight' in mm_projector_weights.keys():
-                for name, module in self.spatial_w_text_projector.named_parameters():
-                    module.data=mm_projector_weights[f"base_model.model.model.prefusion_layers.{name}"].data.type_as(module.data)
-                    # module.requires_grad = False
-                self.load_spatial_w_text_projector=True
-                print("load pretrained prefusion_layers")
-
-        if not self.load_prefusion_layers:
-            if getattr(model_args, 'pretrain_prefusion', None):
-                model_weights = torch.load(model_args.pretrain_prefusion, map_location='cpu')
-                for name, module in self.prefusion_layers.named_parameters():
-                    module.data=model_weights[f"{name}"].data.type_as(module.data)
-                    module.requires_grad = True
-                print(f"load pretrain_prefusion from {model_args.pretrain_prefusion}")
-                self.load_prefusion_layers=True
+            if not self.load_prefusion_layers:
+                if getattr(model_args, 'pretrain_prefusion', None):
+                    model_weights = torch.load(model_args.pretrain_prefusion, map_location='cpu')
+                    for name, module in self.prefusion_layers.named_parameters():
+                        module.data=model_weights[f"{name}"].data.type_as(module.data)
+                        module.requires_grad = True
+                    print(f"load pretrain_prefusion from {model_args.pretrain_prefusion}")
+                    self.load_prefusion_layers=True
+        
+        
 
 
 def unpad_image(tensor, original_size):
@@ -580,8 +940,8 @@ class LlavaMiniMetaForCausalLM(ABC):
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
                 global_image_features=self.get_model().mm_projector(global_image_features)
 
-                if self.get_model().recurrent_in_prefusion:
-                    global_image_features = self.get_model().recurrent(global_image_features)[0]
+                # if self.get_model().recurrent_in_prefusion:
+                #     global_image_features = self.get_model().recurrent(global_image_features)[0]
                 
                 if self.get_model().recurrent_in_compression:
                     compressed_image_features = self.get_model().recurrent(compressed_image_features)[0]
@@ -629,17 +989,25 @@ class LlavaMiniMetaForCausalLM(ABC):
             position_ids.masked_fill_((~mask).int() == 0, 1)
             
 
-            if self.get_model().recurrent_in_prefusion_residue:
-                # print("recurrent_in_prefusion_residue")
-                recurrent_out = self.get_model().recurrent(x,attention_mask=attention_mask,position_ids=position_ids)[0]
+            # if self.get_model().recurrent_in_prefusion_residue:
+            #     # print("recurrent_in_prefusion_residue")
+            #     recurrent_out = self.get_model().recurrent(x,attention_mask=attention_mask,position_ids=position_ids)[0]
             
             # modality pre-fusion
-            for layer in self.get_model().prefusion_layers:
-                x = layer(x,attention_mask=attention_mask,position_ids=position_ids)[0]
+            if self.get_model().recurrent_as_prefusion:
+                x = self.get_model().prefusion_layers(x, attention_mask=attention_mask, position_ids=position_ids)[0]
+                
+            else:
+                for layer in self.get_model().prefusion_layers:
+                    x = layer(x,attention_mask=attention_mask,position_ids=position_ids)[0]
 
             if self.get_model().recurrent_in_prefusion_residue:
+                recurrent_out = self.get_model().recurrent(x.clone(),attention_mask=attention_mask,position_ids=position_ids)[0]
                 x += recurrent_out
-            
+
+            if self.get_model().recurrent_in_prefusion:
+                x = self.get_model().recurrent(x, attention_mask=attention_mask, position_ids=position_ids)[0]
+
             fusion_text_features=x[:,-1*input_ids.size(1):,:]
             compressed_image_features=x[:,-1*input_ids.size(1)-1*compressed_image_features.size(1):-1*input_ids.size(1),:]
             fusion_text_features=fusion_text_features*(~padding_mask).unsqueeze(-1).int()+all_text_embedding*padding_mask.unsqueeze(-1)

@@ -9,3 +9,5 @@ checkpoints/*
 *.pyc
 /llavamini_scaling/eval/*
 /llava_mini.egg-info
+.vscode/
+.vscode/*

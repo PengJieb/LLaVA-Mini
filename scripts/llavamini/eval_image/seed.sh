@@ -1,11 +1,12 @@
 #!/bin/bash
-LLAVA_MINI_ROOT=path_to_llama_mini_dir
-gpu_list="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+LLAVA_MINI_ROOT=.
+gpu_list="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
 
-model_path=path_to_llava_mini_ckpt
-CKPT=$(basename "$CKPT")
+model_path=./checkpoints/recasprefusion_mean4rec_withcond_lr3e-5_4l_all665k
+# model_path=ICTNLP/llava-mini-llama-3.1-8b
+CKPT=all665k
 echo "Model path is set to: $model_path"
 
 SPLIT="llava_gqa_testdev_balanced"
@@ -14,7 +15,7 @@ DATA_ROOT=$LLAVA_MINI_ROOT/playground/data
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python $LLAVA_MINI_ROOT/llavamini/eval/model_vqa_loader.py \
         --model-path ${model_path} \
-        --question-file $DATA_ROOT/eval/seed_bench/llava-seed-bench.jsonl \
+        --question-file $DATA_ROOT/eval/seed_bench/llava-seed-bench-filtered.jsonl \
         --image-folder $DATA_ROOT/eval/seed_bench/SEED-Bench  \
         --answers-file ./playground/data/eval/seed_bench/answers/$CKPT/${CHUNKS}_${IDX}.jsonl \
         --num-chunks $CHUNKS \
@@ -39,5 +40,7 @@ done
 python scripts/convert_seed_for_submission.py \
     --annotation-file $DATA_ROOT/eval/seed_bench/SEED-Bench/SEED-Bench.json\
     --result-file $output_file \
-    --result-upload-file ./playground/data/eval/seed_bench/answers_upload/$CKPT.jsonl > ./playground/data/eval/seed_bench/answers/$CKPT/res.txt
+    --result-upload-file ./playground/data/eval/seed_bench/answers_upload/$CKPT.jsonl > ./playground/data/eval/seed_bench/answers/$CKPT/res_665k_12.txt
+
+cat ./playground/data/eval/seed_bench/answers/$CKPT/res_665k_12.txt
 

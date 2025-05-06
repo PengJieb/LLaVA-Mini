@@ -1,11 +1,13 @@
 #export HOME=/data3/tianlong
 #  GIT_SSH_COMMAND="ssh -i  /data3/tianlong/.ssh/id_ed25519" git push -u origin dev
 
+# --deepspeed ./scripts/zero2.json \
+
 deepspeed --include localhost:4,5,6,7 --master_port 15354 llavamini/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path ICTNLP/llava-mini-llama-3.1-8b \
     --version llava_llama_3_1 \
-    --data_path ./playground/data/llava_v1_5_mix665k_sub66.5k.json \
+    --data_path ./playground/data/llava_v1_5_mix665k.json \
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
@@ -16,14 +18,14 @@ deepspeed --include localhost:4,5,6,7 --master_port 15354 llavamini/train/train_
     --mm_use_im_patch_token False \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/recasprefusion_mean4rec_lr3e-5_4l_sub66.5k \
-    --num_train_epochs 2 \
+    --output_dir ./checkpoints/recasprefusion_mean4rec_nocond_lr3e-5_4l_all665k \
+    --num_train_epochs 1 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 8 \
     --gradient_accumulation_steps 16 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 100 \
+    --save_steps 500 \
     --save_total_limit 1 \
     --learning_rate 3e-5 \
     --max_grad_norm 1. \

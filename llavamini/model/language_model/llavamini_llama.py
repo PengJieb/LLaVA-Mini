@@ -15,7 +15,7 @@
 
 from typing import List, Optional, Tuple, Union, Callable
 from functools import partial
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import torch
 import torch.nn as nn
@@ -32,7 +32,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
 
 
-from ..llavamini_arch import LlavaMiniMetaModel, LlavaMiniMetaForCausalLM, HuginnRecurrent
+from ..llavamini_arch import LlavaMiniMetaModel, LlavaMiniMetaForCausalLM, HuginnRecurrent, MyRecurrent
 import time
 
 logger = logging.get_logger(__name__)
@@ -50,14 +50,16 @@ class LlavaMiniConfig(LlamaConfig):
     
     recurrent_in_compression = False
     recurrent_in_prefusion = False
+    recurrent_as_prefusion = False
+    recurrent_with_tcond = False
     recurrent_in_llm = False
     recurrent_in_prefusion_residue = False
     recurrent_in_llm_residue = False
     recurrent_in_llm_range = 4
+    recurrent_as_llm = False
+    recurrent_start_idx = 28
     activation_checkpoint_impl = 'per-iteration'
     
-    
-
 
     @property
     def checkpoint(self) -> Callable:
@@ -91,6 +93,9 @@ class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):
         self.recurrent_in_llm = config.recurrent_in_llm
         self.recurrent_in_llm_residue = config.recurrent_in_llm_residue
         self.recurrent_in_llm_range = config.recurrent_in_llm_range
+        self.recurrent_as_llm = config.recurrent_as_llm
+        self.recurrent_start_idx = config.recurrent_start_idx
+        # self.create_recurrent_in_llm()
         # print("recurrent_in_llm_residue", self.recurrent_in_llm_residue, self.recurrent_in_llm_range)
         # print(self.recurrent_in_llm)
         # if config.recurrent_in_llm:
@@ -99,6 +104,24 @@ class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):
     def create_recurrent_in_llm(self):
         if self.recurrent_in_llm or self.recurrent_in_llm_residue:
             self.llm_recurrent = HuginnRecurrent(self.config)
+        if self.recurrent_as_llm:
+            start_idx = self.recurrent_start_idx
+            recurrent = MyRecurrent(self.config)
+            
+            for idx in range(self.config.n_layers_in_recurrent_block):
+                layer_ = self.layers[idx+start_idx]
+                recurrent.core_block[idx].self_attn.q_proj.weight.data = layer_.self_attn.q_proj.weight.data.clone()
+                recurrent.core_block[idx].self_attn.k_proj.weight.data = layer_.self_attn.k_proj.weight.data.clone()
+                recurrent.core_block[idx].self_attn.v_proj.weight.data = layer_.self_attn.v_proj.weight.data.clone()
+                recurrent.core_block[idx].self_attn.o_proj.weight.data = layer_.self_attn.o_proj.weight.data.clone()
+                recurrent.core_block[idx].mlp.gate_proj.weight.data = layer_.mlp.gate_proj.weight.data.clone()
+                recurrent.core_block[idx].mlp.up_proj.weight.data = layer_.mlp.up_proj.weight.data.clone()
+                recurrent.core_block[idx].mlp.down_proj.weight.data = layer_.mlp.down_proj.weight.data.clone()
+                recurrent.core_block[idx].input_layernorm.weight.data = layer_.input_layernorm.weight.data.clone()
+                recurrent.core_block[idx].post_attention_layernorm.weight.data = layer_.post_attention_layernorm.weight.data.clone()
+            del self.layers[start_idx:start_idx+self.config.n_layers_in_recurrent_block]
+
+            self.llm_recurrent = recurrent
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
@@ -169,20 +192,8 @@ class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
+            if self.recurrent_as_llm and i==self.recurrent_start_idx and self.llm_recurrent is not None:
+                layer_outputs = self.llm_recurrent(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -192,6 +203,32 @@ class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
+            else:
+                if use_cache and i>self.recurrent_start_idx:
+                    decoder_layer.self_attn.layer_idx = i-1
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
 
             hidden_states = layer_outputs[0]
             
@@ -211,6 +248,18 @@ class LlavaMiniLlamaModel(LlavaMiniMetaModel, LlamaModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        if self.recurrent_as_llm and self.recurrent_start_idx==len(self.layers) and self.llm_recurrent is not None:
+            hidden_states = self.llm_recurrent(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )[0]
 
         hidden_states = self.norm(hidden_states)
 

@@ -15,6 +15,7 @@ from transformers.trainer import (
 )
 from typing import List, Optional
 from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 
 from transformers import Trainer
@@ -359,3 +360,41 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+    # def compute_grad_norm(self, model):
+    #     total_norm = 0.0
+    #     for p in model.parameters():
+    #         if p.grad is not None:
+    #             param_norm = p.grad.data.norm(2)
+    #             total_norm += param_norm.item() ** 2
+    #     return total_norm ** 0.5
+        
+    # def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    #     model.train()
+    #     inputs = self._prepare_inputs(inputs)
+
+    #     with self.compute_loss_context_manager():
+    #         loss = self.compute_loss(model, inputs)
+
+    #     del inputs
+    #     if (
+    #         self.args.torch_empty_cache_steps is not None
+    #         and self.state.global_step % self.args.torch_empty_cache_steps == 0
+    #     ):
+    #         torch.cuda.empty_cache()
+
+    #     kwargs = {}
+
+    #     if self.args.n_gpu > 1:
+    #         loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+    #     self.accelerator.backward(loss, **kwargs)
+
+    #     grad_norm = self.compute_grad_norm(model)
+    #     if not torch.isfinite(torch.tensor(grad_norm)) or grad_norm==0:
+    #         print(f"Step {self.state.global_step}: Grad norm is {grad_norm}. Skipping optimizer step.")
+    #         self.optimizer.zero_grad()
+    #         return loss.detach()  # Skip optimizer update
+
+    #     return loss.detach() / self.args.gradient_accumulation_steps
+

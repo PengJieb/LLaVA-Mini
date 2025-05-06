@@ -1,11 +1,11 @@
 #!/bin/bash
 LLAVA_MINI_ROOT=path_to_llama_mini_dir
-gpu_list="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+gpu_list="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
 
-model_path=path_to_llava_mini_ckpt
-CKPT=$(basename "$CKPT")
+model_path='./checkpoints/recasprefusion_mean4rec_withcond_lr3e-5_4l_all665k'
+CKPT=all665k
 echo "Model path is set to: $model_path"
 
 SPLIT="mmbench_dev_20230712"

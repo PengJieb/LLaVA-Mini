@@ -1,11 +1,12 @@
 #!/bin/bash
-LLAVA_MINI_ROOT=path_to_llama_mini_dir
-gpu_list="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+LLAVA_MINI_ROOT='.'
+gpu_list="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
 
-model_path=path_to_llava_mini_ckpt
-CKPT=$(basename "$CKPT")
+model_path=./checkpoints/recasprefusion_mean4rec_lr3e-5_4l_sub66.5k
+# model_path=ICTNLP/llava-mini-llama-3.1-8b
+CKPT=retrainsub
 echo "Model path is set to: $model_path"
 
 SPLIT="llava_gqa_testdev_balanced"
@@ -44,4 +45,6 @@ python convert_answer_to_mme.py --experiment $CKPT
 
 cd eval_tool
 
-python calculation.py --results_dir answers/$CKPT >> $LLAVA_MINI_ROOT/playground/data/eval/MME/answers/$CKPT/res.txt
+python calculation.py --results_dir answers/$CKPT #> $LLAVA_MINI_ROOT/playground/data/eval/MME/answers/$CKPT/res_alldata.txt
+
+#cat $LLAVA_MINI_ROOT/playground/data/eval/MME/answers/$CKPT/res_alldata.txt

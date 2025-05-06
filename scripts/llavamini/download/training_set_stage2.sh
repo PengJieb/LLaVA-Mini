@@ -52,7 +52,7 @@ echo "Downloading OCR-VQA dataset..."
 mkdir playground/data/ocr_vqa
 gdown --no-check-certificate https://drive.google.com/uc?id=1r0tyZUwGCc4wIG4RkiglCGNL_nFJjR6Q -O playground/data/ocr_vqa/dataset.json
 # copy modified download scripts: enhanced by error check and multi-process download
-cp llavamini_scaling/loadDataset.py playground/data/ocr_vqa
+cp llavamini/loadDataset.py playground/data/ocr_vqa
 cd playground/data/ocr_vqa
 python loadDataset.py
 cd -

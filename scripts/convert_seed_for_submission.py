@@ -11,7 +11,7 @@ def get_args():
     return parser.parse_args()
 
 
-def eval_single(result_file, eval_only_type=None):
+def eval_single(result_file, data, eval_only_type=None):
     results = {}
     for line in open(result_file):
         row = json.loads(line)
@@ -57,18 +57,18 @@ if __name__ == "__main__":
     data = json.load(open(args.annotation_file))
     ques_type_id_to_name = {id:n for n,id in data['question_type'].items()}
 
-    results = eval_single(args.result_file)
-    eval_single(args.result_file, eval_only_type='image')
-    eval_single(args.result_file, eval_only_type='video')
+    results = eval_single(args.result_file, data)
+    eval_single(args.result_file, data, eval_only_type='image')
+    eval_single(args.result_file, data, eval_only_type='video')
 
-    with open(args.result_upload_file, 'w') as fp:
-        for question in data['questions']:
-            qid = question['question_id']
-            if qid in results:
-                result = results[qid]
-            else:
-                result = results[int(qid)]
-            fp.write(json.dumps({
-                'question_id': qid,
-                'prediction': result['text']
-            }) + '\n')
+    # with open(args.result_upload_file, 'w') as fp:
+    #     for question in data['questions']:
+    #         qid = question['question_id']
+    #         if qid in results:
+    #             result = results[qid]
+    #         else:
+    #             result = results[int(qid)]
+    #         fp.write(json.dumps({
+    #             'question_id': qid,
+    #             'prediction': result['text']
+    #         }) + '\n')
